@@ -50200,27 +50200,6 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_5__["default"].plugins
         }
       },
 
-      onMessageSubmitted(text, spoiler_hint) {
-        /* This method gets called once the user has typed a message
-         * and then pressed enter in a chat box.
-         *
-         *  Parameters:
-         *    (String) text - The chat message text.
-         *    (String) spoiler_hint - A hint in case the message
-         *      text is a hidden/spoiler message. See XEP-0382
-         */
-        if (!_converse.connection.authenticated) {
-          return this.showHelpMessages(['Sorry, the connection has been lost, ' + 'and your message could not be sent'], 'error');
-        }
-
-        if (this.parseMessageForCommands(text)) {
-          return;
-        }
-
-        const attrs = this.model.getOutgoingMessageAttributes(text, spoiler_hint);
-        this.model.sendMessage(attrs);
-      },
-
       setChatState(state, options) {
         /* Mutator for setting the chat state of this chat session.
          * Handles clearing of any chat state notification timeouts and
@@ -50247,7 +50226,7 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_5__["default"].plugins
         return this;
       },
 
-      onFormSubmitted(ev) {
+      async onFormSubmitted(ev) {
         ev.preventDefault();
         const textarea = this.el.querySelector('.chat-textarea'),
               message = textarea.value;
@@ -50256,24 +50235,31 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_5__["default"].plugins
           return;
         }
 
-        let spoiler_hint;
-
-        if (this.model.get('composing_spoiler')) {
-          const hint_el = this.el.querySelector('form.sendXMPPMessage input.spoiler-hint');
-          spoiler_hint = hint_el.value;
-          hint_el.value = '';
+        if (!_converse.connection.authenticated) {
+          this.showHelpMessages(['Sorry, the connection has been lost, and your message could not be sent'], 'error');
+          return;
         }
 
-        textarea.value = '';
-        _converse_headless_utils_emoji__WEBPACK_IMPORTED_MODULE_21__["default"].removeClass('correcting', textarea);
-        textarea.focus(); // Trigger input event, so that the textarea resizes
+        let spoiler_hint,
+            hint_el = {};
 
-        const event = document.createEvent('Event');
-        event.initEvent('input', true, true);
-        textarea.dispatchEvent(event);
-        this.onMessageSubmitted(message, spoiler_hint);
+        if (this.model.get('composing_spoiler')) {
+          hint_el = this.el.querySelector('form.sendXMPPMessage input.spoiler-hint');
+          spoiler_hint = hint_el.value;
+        }
 
-        _converse.emit('messageSend', message); // Suppress events, otherwise superfluous CSN gets set
+        if (this.parseMessageForCommands(message) || (await this.model.sendMessage(this.model.getOutgoingMessageAttributes(message, spoiler_hint)))) {
+          hint_el.value = '';
+          textarea.value = '';
+          _converse_headless_utils_emoji__WEBPACK_IMPORTED_MODULE_21__["default"].removeClass('correcting', textarea);
+          textarea.focus(); // Trigger input event, so that the textarea resizes
+
+          const event = document.createEvent('Event');
+          event.initEvent('input', true, true);
+          textarea.dispatchEvent(event);
+
+          _converse.emit('messageSend', message);
+        } // Suppress events, otherwise superfluous CSN gets set
         // immediately after the message, causing rate-limiting issues.
 
 
@@ -55990,6 +55976,15 @@ const KEY_ALGO = {
   'length': 128
 };
 
+class IQError extends Error {
+  constructor(message, iq) {
+    super(message, iq);
+    this.name = 'IQError';
+    this.iq = iq;
+  }
+
+}
+
 function parseBundle(bundle_el) {
   /* Given an XML element representing a user's OMEMO bundle, parse it
    * and return a map.
@@ -56021,7 +56016,7 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
     return !_.isNil(window.libsignal) && !f.includes('converse-omemo', _converse.blacklisted_plugins);
   },
 
-  dependencies: ["converse-chatview"],
+  dependencies: ["converse-chatview", "converse-pubsub"],
   overrides: {
     ProfileModal: {
       events: {
@@ -56277,6 +56272,29 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
         }));
       },
 
+      handleError(e) {
+        const _converse = this.__super__._converse,
+              __ = _converse.__;
+
+        if (e.name === 'IQError') {
+          const err_msgs = [];
+
+          if (sizzle(`presence-subscription-required[xmlns="${Strophe.NS.PUBSUB_ERROR}"]`, e.iq).length) {
+            this.save('omemo_supported', false);
+            err_msgs.push(__("Sorry, unable to send an encrypted message because %1$s " + "requires you to be subscribed to their presence in order to see their OMEMO information", e.iq.getAttribute('from')));
+          } else {
+            err_msgs.push(__("Unable to send an encrypted message due to an unexpected error."));
+            err_msgs.push(e.iq.outerHTML());
+          }
+
+          _converse.api.alert.show(Strophe.LogLevel.ERROR, __('Error'), err_msgs);
+
+          _converse.log(e, Strophe.LogLevel.ERROR);
+        } else {
+          throw e;
+        }
+      },
+
       async sendMessage(attrs) {
         const _converse = this.__super__._converse,
               __ = _converse.__;
@@ -56284,19 +56302,17 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
         if (this.get('omemo_active') && attrs.message) {
           attrs['is_encrypted'] = true;
           attrs['plaintext'] = attrs.message;
-          const devices = await _converse.getBundlesAndBuildSessions(this);
-          const stanza = await _converse.createOMEMOMessageStanza(this, this.messages.create(attrs), devices);
 
           try {
+            const devices = await _converse.getBundlesAndBuildSessions(this);
+            const stanza = await _converse.createOMEMOMessageStanza(this, this.messages.create(attrs), devices);
             this.sendMessageStanza(stanza);
           } catch (e) {
-            this.messages.create({
-              'message': __("Sorry, could not send the message due to an error.") + ` ${e.message}`,
-              'type': 'error'
-            });
-
-            _converse.log(e, Strophe.LogLevel.ERROR);
+            this.handleError(e);
+            return false;
           }
+
+          return true;
         } else {
           return this.__super__.sendMessage.apply(this, arguments);
         }
@@ -56776,7 +56792,7 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
         return _converse.api.pubsub.publish(null, node, item, options);
       },
 
-      generateMissingPreKeys() {
+      async generateMissingPreKeys() {
         const current_keys = this.getPreKeys(),
               missing_keys = _.difference(_.invokeMap(_.range(0, _converse.NUM_PREKEYS), Number.prototype.toString), _.keys(current_keys));
 
@@ -56786,20 +56802,21 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
           return Promise.resolve();
         }
 
-        return Promise.all(_.map(missing_keys, id => libsignal.KeyHelper.generatePreKey(parseInt(id, 10)))).then(keys => {
-          _.forEach(keys, k => this.storePreKey(k.keyId, k.keyPair));
+        const keys = await Promise.all(_.map(missing_keys, id => libsignal.KeyHelper.generatePreKey(parseInt(id, 10))));
 
-          const marshalled_keys = _.map(this.getPreKeys(), k => ({
-            'id': k.keyId,
-            'key': u.arrayBufferToBase64(k.pubKey)
-          })),
-                devicelist = _converse.devicelists.get(_converse.bare_jid),
-                device = devicelist.devices.get(this.get('device_id'));
+        _.forEach(keys, k => this.storePreKey(k.keyId, k.keyPair));
 
-          return device.getBundle().then(bundle => device.save('bundle', _.extend(bundle, {
-            'prekeys': marshalled_keys
-          })));
-        });
+        const marshalled_keys = _.map(this.getPreKeys(), k => ({
+          'id': k.keyId,
+          'key': u.arrayBufferToBase64(k.pubKey)
+        })),
+              devicelist = _converse.devicelists.get(_converse.bare_jid),
+              device = devicelist.devices.get(this.get('device_id'));
+
+        const bundle = await device.getBundle();
+        device.save('bundle', _.extend(bundle, {
+          'prekeys': marshalled_keys
+        }));
       },
 
       async generateBundle() {
@@ -56898,7 +56915,11 @@ _converse_headless_converse_core__WEBPACK_IMPORTED_MODULE_0__["default"].plugins
         try {
           iq = await _converse.api.sendIQ(stanza);
         } catch (iq) {
-          return _converse.log(iq.outerHTML, Strophe.LogLevel.ERROR);
+          throw new IQError("Could not fetch bundle", iq);
+        }
+
+        if (iq.querySelector('error')) {
+          throw new IQError("Could not fetch bundle", iq);
         }
 
         const publish_el = sizzle(`items[node="${Strophe.NS.OMEMO_BUNDLES}:${this.get('id')}"]`, iq).pop(),
@@ -61917,7 +61938,8 @@ _converse_core__WEBPACK_IMPORTED_MODULE_2__["default"].plugins.add('converse-cha
           message = this.messages.create(attrs);
         }
 
-        return this.sendMessageStanza(this.createMessageStanza(message));
+        this.sendMessageStanza(this.createMessageStanza(message));
+        return true;
       },
 
       sendChatState() {
